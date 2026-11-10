@@ -6,6 +6,11 @@
 #include <queue>
 #include <stdexcept>
 #include <vector>
+//import kagglehub
+
+//path = kagglehub.dataset_download("balraj98/duts-saliency-detection-dataset")
+
+//print("Path to dataset files:", path)
 
 using namespace std;
 using namespace cv;
@@ -92,9 +97,9 @@ double calculateEdgeWeight(const Mat& image, const Mat& saliency, int x1, int y1
     double colorDistance = colorDifference(image.at<Vec3b>(y1, x1), image.at<Vec3b>(y2, x2));
     
     // assigns parameters of formula
-    const double epsilon = 0.01;
-    const double alpha = 3.0;
-    const double beta = 120.0;
+    const double epsilon = 0.01; // makes sure the fucntion is positive
+    const double alpha = .5; // higher means more restrictive on saliency edge cost
+    const double beta = 2.0; // Controls influence of color differences makes it more expensive for D's to cross the strong color boundries
 
     // computes edge weights
     return epsilon + alpha * (1.0 - destinationSaliency) + beta * colorDistance;
@@ -167,6 +172,41 @@ vector<double> dijkstra(const vector<vector<Edge>>& graph, int source){
     return distances;
 }
 
+// Calculates combined saliency using original saliency
+// and Dijkstra shortest-path distances
+// tau controls how quickly the influence of the score decreases, smaller values create more localized regions
+// Larger values allow the sources influence to extend further, very large values make original saliency map dominate the results
+Mat calculateCombinedSaliency(const Mat& saliency, const vector<double>& distances, double tau){
+    Mat combinedSaliency(saliency.rows, saliency.cols, CV_64F, Scalar(0));
+
+    int width = saliency.cols;
+
+    for (int y=0; y < saliency.rows; ++y){
+        for (int x=0; x<saliency.cols;++x){
+            int node = pixelToNode(x, y, width);
+
+            double originalSaliency = saliency.at<double>(y, x);
+
+            double pathDistance = distances[node];
+
+            // ignore unreachable pixels
+            if (!isfinite(pathDistance)){
+                continue;
+            }
+
+            // calculate distance-based influence
+            double pathInfluence = exp(-pathDistance / tau);
+
+            // Combine original saliency with path influence 
+            double combinedScore = originalSaliency * pathInfluence;
+
+            combinedSaliency.at<double>(y, x) = combinedScore;
+        }
+    }
+    // returns new matrix containing combined saliency scores
+    return combinedSaliency;
+}
+
 // Finds the pixel with the highest saliency
 Point findMostSalientPixel(const Mat& saliency){
     Point maximumLocation;
@@ -232,6 +272,86 @@ Mat visualizeSalientRegions(const Mat& image, const Mat& saliency, double thresh
     return output;
 }
 
+// using the combined saliency matrix the function identifies groups of pixels that have hight combined scores
+// Using openCV's connectedComponentWithStats(), apply a threshold to the combined saliency map, convert result into a binary image
+// identify connected components, remove very small regions, and visualize the remaining regions
+Mat visualizeCombinedRegions(const Mat& image, const Mat& combinedSaliency, double threshold){
+    Mat output = image.clone();
+
+    // Convert combined saliency into a binary mask
+    Mat binaryMask;
+
+    threshold = max(0.0, min(.10, threshold));
+
+    compare(combinedSaliency, threshold, binaryMask, CMP_GE);
+
+    // smooth the binary mask slightly to reduce noise
+    Mat smoothedMask;
+
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(15, 15));
+    morphologyEx(binaryMask, smoothedMask, MORPH_CLOSE, kernel);
+
+    // Identify connected regions
+    Mat labels;
+    Mat stats;
+    Mat centroids;
+
+    int numberOfLabels = connectedComponentsWithStats(smoothedMask,labels, stats, centroids, 8, CV_32S);
+
+    // Ignore very small regions
+    int minimumArea = max(10, static_cast<int>(image.total() * 0.01));
+
+    int regionCount = 0;
+    for (int label = 1; label < numberOfLabels; ++label){
+        int area = stats.at<int>(label, CC_STAT_AREA);
+
+        if (area < minimumArea){
+            continue;
+        }
+
+        int x = stats.at<int>(label, CC_STAT_LEFT);
+        int y = stats.at<int>(label, CC_STAT_TOP);
+
+        int width = stats.at<int>(label, CC_STAT_WIDTH);
+        int height = stats.at<int>(label, CC_STAT_HEIGHT);
+
+        regionCount++;
+
+        // Color pixels belonging to this region
+        for (int py = y; py < y + height; ++py){
+            for (int px = x; px <x + width; ++px){
+                if (labels.at<int>(py, px) == label){
+                    Vec3b& pixel = output.at<Vec3b>(py, px);
+
+                    // Blend region with red for visualization
+                    pixel[0] = static_cast<uchar>(pixel[0] * 0.5);
+                    pixel[1] = static_cast<uchar>(pixel[1] * 0.5);
+                    pixel[2] = static_cast<uchar>(pixel[2] * 0.5 + 127);
+                }
+            }
+        }
+        // Creating a bouding box around the region
+        rectangle(output, Rect(x, y, width, height), Scalar(0, 255, 0), 2);
+
+        cout << "Region " << regionCount << " | Area: " << area << " pixels" << endl;
+    }
+    cout << "Total salient regions identified: " << regionCount << endl;
+
+    // returns connected regions that satisfy conbined saliency threshold
+    // connects adjacent pixels not necessarily complete objects if two objects touch they may become one region
+    return output;
+}
+
+// Create a combined heatmap from combined saliency scores
+Mat createCombinedHeatmap(const Mat& combinedSaliency){
+    Mat grayscale;
+    Mat heatmap;
+
+    combinedSaliency.convertTo(grayscale, CV_8U, 255.0);
+    applyColorMap(grayscale, heatmap, COLORMAP_JET);
+    return heatmap;
+}
+
 
 int main(int argc, char* argv[]){
     try {
@@ -252,7 +372,7 @@ int main(int argc, char* argv[]){
 
 
         // resizes the image for computations
-        const int maxDimension = 2600;
+        const int maxDimension = 1000;
         double scale = min(1.0, static_cast<double>(maxDimension) / max(original.cols, original.rows));
 
         Mat image;
@@ -283,35 +403,45 @@ int main(int argc, char* argv[]){
         vector<double> distances = dijkstra(graph, source);
         cout << "Completed Dijkstra's" << endl;
 
+        // Calculating combined saliency using Dijkstra distances
+        cout << "Calculating combined saliency..." << endl;
 
-        //Creating visualization
-        //cout<<"creating heatmap" <<endl;
+        double tau = 75.0; // controls how quick dijkstra influence decreases
+        cout << "Tau" << tau << endl;
+
+        Mat combinedSaliency = calculateCombinedSaliency(saliency, distances, tau);
+
+        cout << "Combined saliency calculated." << endl;
+
+        // Creates original saliency heatmap
         Mat heatmap = createHeatmap(saliency);
-        //cout<<"done with heatmap" <<endl;
-        //cout<<"making path image" <<endl;
-        Mat pathImage = visualizePaths(image, distances, source, 200.0);
-        //cout<<"done with path image" <<endl;
-        //cout<<"creating region image" <<endl;
-        Mat regionImage = visualizeSalientRegions(image, saliency, 0.50);
-        //cout<<"done with region image" <<endl;
 
+        //create combined saliency heatmap
+        Mat combinedHeatmap = createCombinedHeatmap(combinedSaliency);
 
-        //saves outputs
+        // Identify regions using combined saliency
+        cout << "Identifying salient regions..." << endl;
+
+        // Threshold allows more or less pixels to qualify as part of a salient region
+        Mat regionImage = visualizeCombinedRegions(image, combinedSaliency, 0.10);
+
+        cout << "Region identification completed" << endl;
+
+        // Save outputs
         imwrite("saliency_map.jpg", heatmap);
-        imwrite("dijkstra_paths.jpg", pathImage);
-        imwrite("salient_regions.jpg", regionImage);
+        imwrite("combined_saliency.jpg", combinedHeatmap);
+        imwrite("combined_regions.jpg", regionImage);
 
         cout << "\nResults saved:" << endl;
-        cout << "  saliency_map.jpg" << endl;
-        cout << "  dijkstra_paths.jpg" << endl;
-        cout << "  salient_regions.jpg" << endl;
+        cout << "saliency_map.jpg" << endl;
+        cout << "combined_saliency.jpg" << endl;
+        cout << "combined_regions.jpg" << endl;
 
-
-        // Display the results.
+        // Display outputs
         imshow("Original Image", image);
-        imshow("Saliency Heatmap", heatmap);
-        imshow("Salient Regions", regionImage);
-        imshow("Dijkstra Paths", pathImage);
+        imshow("Original Saliency", heatmap);
+        imshow("Combined Saliency - Dijkstra", combinedHeatmap);
+        imshow("Identified Salient Regions", regionImage);
 
         waitKey(0);
 
